@@ -435,22 +435,27 @@ class SourceStream:
         self._row_order = None
         self._row_cursor = 0
 
+    def _open_entry(self, entry_index: int) -> None:
+        entry = self.entries[entry_index]
+        path = self.data_dir / entry["path"]
+        self._h5 = h5py.File(path, "r")
+        self._ds = self._h5["data"]
+        actual_seq_len = int(self._ds.shape[-1])
+        if actual_seq_len != self.expected_seq_len:
+            self._close()
+            raise ValueError(
+                f"{path}: seq_len={actual_seq_len}, "
+                f"expected {self.expected_seq_len}"
+            )
+
     def _open_next_file(self) -> None:
         self._close()
         if self._file_cursor >= len(self._file_order):
             self._reshuffle_files()
 
-        entry = self.entries[self._file_order[self._file_cursor]]
+        entry_index = self._file_order[self._file_cursor]
         self._file_cursor += 1
-        path = self.data_dir / entry["path"]
-
-        self._h5 = h5py.File(path, "r")
-        self._ds = self._h5["data"]
-        if int(self._ds.shape[-1]) != self.expected_seq_len:
-            raise ValueError(
-                f"{path}: seq_len={self._ds.shape[-1]}, "
-                f"expected {self.expected_seq_len}"
-            )
+        self._open_entry(entry_index)
         n = int(self._ds.shape[0])
         self._row_order = np.arange(n, dtype=np.int64)
         # NumPy shuffle is faster and more compact than a Python list.
@@ -468,6 +473,51 @@ class SourceStream:
         # feature 0 = input token ids.
         arr = np.asarray(self._ds[idx, 0, :], dtype=np.int64)
         return arr
+
+    def state_dict(self) -> dict:
+        return {
+            "rng_state": self.rng.getstate(),
+            "entry_paths": [entry["path"] for entry in self.entries],
+            "file_order": list(self._file_order),
+            "file_cursor": self._file_cursor,
+            "row_order": (
+                self._row_order.copy() if self._row_order is not None else None
+            ),
+            "row_cursor": self._row_cursor,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self._close()
+        if state.get("entry_paths") not in (
+            None,
+            [entry["path"] for entry in self.entries],
+        ):
+            raise ValueError("checkpoint data-stream manifest entries have changed")
+        file_order = [int(i) for i in state["file_order"]]
+        if sorted(file_order) != list(range(len(self.entries))):
+            raise ValueError("checkpoint data-stream files do not match manifest")
+
+        self._file_order = file_order
+        self._file_cursor = int(state["file_cursor"])
+        self.rng.setstate(state["rng_state"])
+        row_order = state.get("row_order")
+        if row_order is None:
+            return
+        if not 0 < self._file_cursor <= len(self._file_order):
+            raise ValueError("invalid data-stream file cursor in checkpoint")
+
+        current_entry = self._file_order[self._file_cursor - 1]
+        self._open_entry(current_entry)
+        restored_order = np.asarray(row_order, dtype=np.int64)
+        if restored_order.ndim != 1 or len(restored_order) != int(self._ds.shape[0]):
+            self._close()
+            raise ValueError("checkpoint row order does not match current shard")
+        row_cursor = int(state["row_cursor"])
+        if not 0 <= row_cursor <= len(restored_order):
+            self._close()
+            raise ValueError("invalid data-stream row cursor in checkpoint")
+        self._row_order = restored_order.copy()
+        self._row_cursor = row_cursor
 
 
 class MixedTokenStream:
@@ -507,6 +557,24 @@ class MixedTokenStream:
     def next_ids(self) -> Tuple[str, np.ndarray]:
         source = self.rng.choices(self.names, weights=self.weights, k=1)[0]
         return source, self.streams[source].next_ids()
+
+    def state_dict(self) -> dict:
+        return {
+            "version": 1,
+            "rng_state": self.rng.getstate(),
+            "sources": {
+                name: source.state_dict()
+                for name, source in self.streams.items()
+            },
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        saved_sources = state["sources"]
+        if set(saved_sources) != set(self.streams):
+            raise ValueError("checkpoint data sources do not match current data mix")
+        self.rng.setstate(state["rng_state"])
+        for name, source in self.streams.items():
+            source.load_state_dict(saved_sources[name])
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +725,9 @@ def save_checkpoint(
     opt_step: int,
     tokens_seen: int,
     args: argparse.Namespace,
+    stream: MixedTokenStream,
+    scaler,
+    source_counts: Dict[str, int],
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"checkpoint_step_{opt_step:07d}.pt"
@@ -673,19 +744,49 @@ def save_checkpoint(
         "opt_step": opt_step,
         "tokens_seen": tokens_seen,
         "args": checkpoint_args,
+        "stream": stream.state_dict(),
+        "source_counts": dict(source_counts),
+        "scaler": scaler.state_dict(),
+        "rng": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": [state.cpu() for state in torch.cuda.get_rng_state_all()],
+        },
     }
-    torch.save(state, path)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(state, temporary_path)
+    os.replace(temporary_path, path)
 
     latest = out_dir / "latest.txt"
-    latest.write_text(path.name + "\n", encoding="utf-8")
+    temporary_latest = latest.with_suffix(latest.suffix + ".tmp")
+    temporary_latest.write_text(path.name + "\n", encoding="utf-8")
+    os.replace(temporary_latest, latest)
     print(f"saved: {path}")
 
 
-def load_checkpoint(path: Path, model, optimizer) -> Tuple[int, int]:
-    ckpt = torch.load(path, map_location="cpu")
+def load_checkpoint(path: Path, model, optimizer) -> dict:
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
-    return int(ckpt.get("opt_step", 0)), int(ckpt.get("tokens_seen", 0))
+    return ckpt
+
+
+def find_latest_checkpoint(out_dir: Path) -> Path | None:
+    latest = out_dir / "latest.txt"
+    if latest.exists():
+        checkpoint_name = latest.read_text(encoding="utf-8").strip()
+        if checkpoint_name:
+            checkpoint = Path(checkpoint_name)
+            if not checkpoint.is_absolute():
+                checkpoint = out_dir / checkpoint
+            checkpoint = checkpoint.resolve()
+            if checkpoint.is_file():
+                return checkpoint
+        print(f"WARNING: ignoring stale or empty checkpoint pointer: {latest}")
+
+    checkpoints = sorted(out_dir.glob("checkpoint_step_*.pt"))
+    return checkpoints[-1].resolve() if checkpoints else None
 
 
 def cmd_train(args: argparse.Namespace) -> None:
@@ -810,22 +911,53 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     opt_step = 0
     tokens_seen = 0
-    if args.resume:
-        resume_path = Path(args.resume).resolve()
-        opt_step, tokens_seen = load_checkpoint(resume_path, model, optimizer)
+    source_counts: Dict[str, int] = {name: 0 for name in SOURCES}
+    out_dir = Path(args.out_dir).resolve()
+    resume_path = Path(args.resume).resolve() if args.resume else None
+    if resume_path is None and not args.no_auto_resume:
+        resume_path = find_latest_checkpoint(out_dir)
+        if resume_path is None:
+            print(f"no checkpoint found in {out_dir}; starting from scratch")
+
+    if resume_path is not None:
+        ckpt = load_checkpoint(resume_path, model, optimizer)
+        opt_step = int(ckpt.get("opt_step", 0))
+        tokens_seen = int(ckpt.get("tokens_seen", 0))
+        exact_resume = True
+        if "stream" in ckpt:
+            stream.load_state_dict(ckpt["stream"])
+        else:
+            exact_resume = False
+            print("WARNING: legacy checkpoint has no data-stream state; data order restarts")
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+        source_counts.update(
+            {name: int(count) for name, count in ckpt.get("source_counts", {}).items()}
+        )
+        rng = ckpt.get("rng")
+        if rng is not None:
+            random.setstate(rng["python"])
+            np.random.set_state(rng["numpy"])
+            torch.set_rng_state(rng["torch"])
+            cuda_states = rng.get("cuda", [])
+            if len(cuda_states) != torch.cuda.device_count():
+                raise ValueError(
+                    "checkpoint CUDA RNG device count does not match this system"
+                )
+            torch.cuda.set_rng_state_all(cuda_states)
+        else:
+            exact_resume = False
+            print("WARNING: legacy checkpoint has no RNG state; resume is not exact")
         print(
             f"resumed {resume_path}: step={opt_step:,}, "
-            f"tokens={tokens_seen:,}"
+            f"tokens={tokens_seen:,}, exact_state={'yes' if exact_resume else 'no'}"
         )
 
     optimizer.zero_grad(set_to_none=True)
-    out_dir = Path(args.out_dir).resolve()
 
     start_time = time.time()
     last_log_time = start_time
     last_log_tokens = tokens_seen
-    source_counts: Dict[str, int] = {name: 0 for name in SOURCES}
-
     while tokens_seen < args.tokens:
         current_lr = cosine_lr(
             opt_step,
@@ -940,6 +1072,9 @@ def cmd_train(args: argparse.Namespace) -> None:
                 opt_step,
                 tokens_seen,
                 args,
+                stream,
+                scaler,
+                source_counts,
             )
 
     save_checkpoint(
@@ -949,6 +1084,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         opt_step,
         tokens_seen,
         args,
+        stream,
+        scaler,
+        source_counts,
     )
 
     elapsed = time.time() - start_time
@@ -991,7 +1129,17 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--model-file", required=True)
     t.add_argument("--triton-file", required=True)
     t.add_argument("--out-dir", default="./hgss1b_run")
-    t.add_argument("--resume", default=None)
+    resume = t.add_mutually_exclusive_group()
+    resume.add_argument(
+        "--resume",
+        default=None,
+        help="resume from this checkpoint (default: use OUT_DIR/latest.txt)",
+    )
+    resume.add_argument(
+        "--no-auto-resume",
+        action="store_true",
+        help="start from scratch even when OUT_DIR/latest.txt exists",
+    )
 
     # Token budget / data mix.
     t.add_argument("--tokens", type=int, default=10_000_000_000)

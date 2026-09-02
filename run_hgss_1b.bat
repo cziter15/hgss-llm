@@ -31,6 +31,8 @@ REM   memory_max = 131072 (128k)
 REM
 REM Usage:
 REM   run_hgss_1b.bat
+REM By default training resumes from OUT_DIR\latest.txt when it exists.
+REM Set FRESH_START=1 to ignore it, or RESUME to an explicit checkpoint path.
 REM
 REM Quick 100M test:
 REM   set TOKENS=100000000
@@ -49,6 +51,10 @@ if not defined PYTHON set "PYTHON=.\.venv\Scripts\python.exe"
 
 if not defined DATA_DIR set "DATA_DIR=.\crystal10b"
 if not defined OUT_DIR set "OUT_DIR=.\hgss1b_run"
+
+set "RESUME_ARGS="
+if defined RESUME set RESUME_ARGS=--resume "!RESUME!"
+if "%FRESH_START%"=="1" set "RESUME_ARGS=--no-auto-resume"
 
 if not defined MODEL_FILE set "MODEL_FILE=.\hgss\model.py"
 if not defined TRITON_FILE set "TRITON_FILE=.\hgss\triton_scan.py"
@@ -91,6 +97,9 @@ echo  HGSS pretraining
 echo ============================================================
 echo Dataset dir : %DATA_DIR%
 echo Output dir  : %OUT_DIR%
+if defined RESUME echo Resume      : %RESUME%
+if "%FRESH_START%"=="1" echo Resume      : disabled (fresh start)
+if not defined RESUME if not "%FRESH_START%"=="1" echo Resume      : automatic from latest.txt
 echo Token budget: %TOKENS%
 echo Code fraction: %CODE_FRACTION%
 echo Model       : D=%DIM% L=%LAYERS% H=%HEADS% K=%D_K% V=%D_V%
@@ -165,6 +174,7 @@ echo.
   --model-file "%MODEL_FILE%" ^
   --triton-file "%TRITON_FILE%" ^
   --out-dir "%OUT_DIR%" ^
+  !RESUME_ARGS! ^
   --tokens %TOKENS% ^
   --code-fraction %CODE_FRACTION% ^
   --seq-len %SEQ_LEN% ^
