@@ -170,7 +170,7 @@ class HGSSConfig:
     # Preserve the complete quaternion-valued scan read instead of retaining
     # only its first real component.  The scalar mode remains available for
     # loading and benchmarking architecture-v4 checkpoints.
-    full_quaternion_read: bool = False
+    full_quaternion_read: bool = True
 
     def __post_init__(self):
         if self.num_layers is not None:
