@@ -661,12 +661,18 @@ def save_checkpoint(
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"checkpoint_step_{opt_step:07d}.pt"
 
+    # argparse also stores the selected command handler in ``func``. Pickling
+    # that function ties the checkpoint to a script running as __main__, which
+    # prevents inference tools from loading it normally.
+    checkpoint_args = {
+        key: value for key, value in vars(args).items() if not callable(value)
+    }
     state = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "opt_step": opt_step,
         "tokens_seen": tokens_seen,
-        "args": vars(args),
+        "args": checkpoint_args,
     }
     torch.save(state, path)
 
